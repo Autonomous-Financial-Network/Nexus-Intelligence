@@ -1,0 +1,19 @@
+{
+  "name": "nexus-intelligence-xyz-docs",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "docusaurus start",
+    "build": "docusaurus build",
+    "lint": "eslint src --ext ts,tsx --max-warnings 0",
+    "format": "prettier --write \"src/**/*.{ts,tsx,css,json}\"",
+    "typecheck": "tsc --noEmit",
+    "test": "echo \"No tests configured yet\" && exit 0",
+    "preview": "vite preview",
+    "clean": "rm -rf dist node_modules/.cache"
+  },
+  "dependencies": {
+    "@docusaurus/core": "^3.1.0",
+    "@docusaurus/preset-classic": "^3.1.0"
+  }
+}

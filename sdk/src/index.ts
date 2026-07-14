@@ -1,0 +1,6 @@
+export { AgentKit } from './agent/AgentKit'
+export { NexusToolkit } from './tools/NexusToolkit'
+export { AgentWalletClient } from './wallet/AgentWalletClient'
+export { SpendingLimitClient } from './limits/SpendingLimitClient'
+export type { AgentKitConfig, AgentSession, PaymentTool } from './agent/types'
+export type { ToolResult } from './tools/NexusToolkit'
