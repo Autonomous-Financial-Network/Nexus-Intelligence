@@ -41,15 +41,26 @@ const TOOLS = [
   {
     name: 'stellar_path_payment',
     icon: '🔄',
-    status: 'planned',
-    description: 'Multi-hop payment routing via SDEX — finds the best conversion path and executes cross-asset payments in a single transaction.',
+    status: 'live',
+    description: 'Cross-asset payment routing via Stellar SDEX using pathPaymentStrictReceive. The recipient gets exactly the requested amount — slippage is controlled by sendMaxAmount. Empty path lets Stellar auto-discover the best route.',
     parameters: [
-      { name: 'recipient', type: 'string', required: true, desc: 'Stellar G... account address' },
-      { name: 'send_asset', type: 'string', required: true, desc: 'Asset to send (e.g. XLM)' },
-      { name: 'receive_asset', type: 'string', required: true, desc: 'Asset recipient receives (e.g. USDC)' },
-      { name: 'amount', type: 'number', required: true, desc: 'Amount to send' },
+      { name: 'recipient',        type: 'string', required: true,  desc: 'Stellar G... account address' },
+      { name: 'send_asset',       type: 'string', required: true,  desc: '"XLM" for native or "CODE:ISSUER" (e.g. "USDC:GA5Z...")'  },
+      { name: 'receive_asset',    type: 'string', required: true,  desc: 'Asset the recipient receives — same format' },
+      { name: 'receive_amount',   type: 'number', required: true,  desc: 'Exact amount the recipient should receive' },
+      { name: 'send_max_amount',  type: 'number', required: true,  desc: 'Maximum amount agent will send (slippage guard)' },
+      { name: 'agent_public_key', type: 'string', required: true,  desc: 'Agent machine key that signs server-side' },
+      { name: 'memo',             type: 'string', required: false, desc: 'Optional payment memo' },
     ],
-    example: `// Wave contribution gap — not yet implemented`,
+    example: `await tools.stellar_path_payment({
+  recipient:       "GABC...XYZ",
+  send_asset:      "XLM",
+  receive_asset:   "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+  receive_amount:  50.00,
+  send_max_amount: 600,   // max XLM to send
+  agent_public_key: agentMachineKey,
+})
+// → { success: true, unsignedXdr: "AAAA...", note: "Sign and submit server-side" }`,
   },
 ]
 

@@ -1,175 +1,206 @@
 /**
- * AgentWalletClient — SDK for the nexus-intelligence-xyz agent_wallet Soroban contract.
+ * AgentWalletClient — SDK wrapper for the agent_wallet Soroban contract.
  *
  * Two distinct signing roles:
- *   - Owner keypair  → createSession() + revokeSession()  (human-held, Freighter)
- *   - Agent keypair  → executePayment()                   (machine key, server-side)
+ *   Owner keypair  → createSession() + revokeSession()  (human-held, Freighter)
+ *   Agent keypair  → executePayment()                   (machine key, server-side)
  *
  * XDR pattern:
- *   method() → buildUnsignedXdr() → caller/agent signs → submitSignedXdr()
+ *   method() → buildUnsignedXdr() → caller signs → submitSignedXdr() → waitForConfirmation()
  */
-import { buildUnsignedXdr, submitSignedXdr, waitForConfirmation, StellarNetwork, XDRResult, SubmitResult } from '../stellar'
+
+import {
+  Contract,
+  SorobanRpc,
+  scValToNative,
+  xdr,
+} from '@stellar/stellar-sdk'
+import {
+  buildUnsignedXdr,
+  submitSignedXdr,
+  waitForConfirmation,
+  NETWORK_CONFIG,
+  StellarNetwork,
+  XDRResult,
+  SubmitResult,
+} from '../stellar'
 import { AgentKitConfig, AgentSession } from '../agent/types'
 
-const STROOPS_PER_USDC = 10_000_000n
-const LEDGERS_PER_DAY  = 17_280
+const STROOPS_PER_USDC = 1e7
 
 export interface CreateSessionParams {
-  agentKey:         string
-  limitPerTx:       bigint  // in stroops
-  limitPerSession:  bigint  // in stroops
-  durationLedgers:  number
-  ownerPublicKey:   string  // owner signs this tx
+  agentKey: string
+  limitPerTx: bigint      // stroops
+  limitPerSession: bigint // stroops
+  durationLedgers: number
+  ownerPublicKey: string
 }
 
 export interface ExecutePaymentParams {
-  sessionId:        bigint
-  recipient:        string
-  amount:           bigint  // in stroops
-  memo:             string
-  agentPublicKey:   string  // agent machine key signs this tx
+  sessionId: bigint
+  recipient: string
+  amount: bigint          // stroops
+  memo: string
+  agentPublicKey: string
 }
 
 export class AgentWalletClient {
-  private network: StellarNetwork
-  private contractId: string
-  private rpcUrl?: string
+  private readonly network: StellarNetwork
+  private readonly contractId: string
+  private readonly rpcUrl: string
 
   constructor(config: AgentKitConfig) {
     this.network    = config.network
     this.contractId = config.agentWalletContractId
-    this.rpcUrl     = config.rpcUrl
+    this.rpcUrl     = config.rpcUrl ?? NETWORK_CONFIG[config.network].rpcUrl
   }
 
+  // ---------------------------------------------------------------------------
+  // Contract write operations
+  // ---------------------------------------------------------------------------
+
   /**
-   * Owner creates a new agent session with on-chain spending caps.
-   * Returns unsigned XDR — owner must sign with Freighter (human action, done once).
-   *
-   * After this is called the owner should store the returned sessionId
-   * and provide it to the agent for subsequent payments.
-   *
-   * @example
-   * const { unsignedXdr } = await client.createSession({
-   *   agentKey: agentMachinePublicKey,
-   *   limitPerTx: 500_0000000n,        // 500 USDC
-   *   limitPerSession: 5000_0000000n,  // 5000 USDC total
-   *   durationLedgers: 17280,          // 24h
-   *   ownerPublicKey: ownerFreighterKey,
-   * })
-   * const signed = await freighter.signTransaction(unsignedXdr, { network: 'TESTNET' })
-   * const { txHash, returnValue } = await client.submit(signed)
-   * const sessionId = BigInt(returnValue as string)
+   * Build unsigned XDR for create_session.
+   * Owner signs with Freighter (once per agent session).
    */
   async createSession(params: CreateSessionParams): Promise<XDRResult> {
-    console.log(
-      `[AgentWalletClient] createSession — agent=${params.agentKey} ` +
-      `limitPerTx=${Number(params.limitPerTx) / 1e7} USDC ` +
-      `limitPerSession=${Number(params.limitPerSession) / 1e7} USDC`
-    )
-
     return buildUnsignedXdr({
-      contractId: this.contractId,
-      functionName: 'create_session',
+      contractId:    this.contractId,
+      functionName:  'create_session',
       args: [
         { type: 'address', value: params.agentKey },
         { type: 'i128',    value: params.limitPerTx },
         { type: 'i128',    value: params.limitPerSession },
         { type: 'u32',     value: params.durationLedgers },
       ],
-      network: this.network,
-      rpcUrl:  this.rpcUrl,
+      network:         this.network,
+      rpcUrl:          this.rpcUrl,
       sourcePublicKey: params.ownerPublicKey,
     })
   }
 
   /**
-   * Agent executes a payment within session limits.
-   * Returns unsigned XDR — signed by the agent machine keypair (NO Freighter, server-side only).
-   *
-   * This is the hot path called autonomously by the AI agent for every payment.
-   * The agent machine key must be configured as a server-side secret — it MUST NOT
-   * be exposed to the browser or any client-side code.
-   *
-   * @example
-   * // Server-side only (agent machine)
-   * const { unsignedXdr } = await client.executePayment({
-   *   sessionId: session.sessionId,
-   *   recipient: 'GABC...',
-   *   amount: 50_0000000n,  // 50 USDC
-   *   memo: 'INV-2026-001',
-   *   agentPublicKey: agentMachineKey,
-   * })
-   * const keypair = Keypair.fromSecret(process.env.AGENT_SECRET_KEY)
-   * const signed = transaction.sign(keypair) // @stellar/stellar-sdk
-   * const { txHash } = await client.submit(signed.toXDR())
+   * Build unsigned XDR for execute_payment.
+   * Agent machine key signs server-side — never exposed to the browser.
    */
   async executePayment(params: ExecutePaymentParams): Promise<XDRResult> {
-    const amountUsdc = Number(params.amount) / 1e7
-    console.log(
-      `[AgentWalletClient] executePayment — session=${params.sessionId} ` +
-      `recipient=${params.recipient} amount=${amountUsdc} USDC`
-    )
-
     return buildUnsignedXdr({
-      contractId: this.contractId,
-      functionName: 'execute_payment',
+      contractId:    this.contractId,
+      functionName:  'execute_payment',
       args: [
         { type: 'u64',     value: params.sessionId },
         { type: 'address', value: params.recipient },
         { type: 'i128',    value: params.amount },
         { type: 'string',  value: params.memo },
       ],
-      network: this.network,
-      rpcUrl:  this.rpcUrl,
+      network:         this.network,
+      rpcUrl:          this.rpcUrl,
       sourcePublicKey: params.agentPublicKey,
     })
   }
 
   /**
-   * Owner revokes a session immediately. All future payments from that session will fail.
-   * Returns unsigned XDR — owner must sign with Freighter.
+   * Build unsigned XDR for revoke_session.
+   * Owner signs with Freighter — immediate on-chain effect.
    */
   async revokeSession(sessionId: bigint, ownerPublicKey: string): Promise<XDRResult> {
-    console.log(`[AgentWalletClient] revokeSession — session=${sessionId}`)
     return buildUnsignedXdr({
-      contractId: this.contractId,
-      functionName: 'revoke_session',
+      contractId:    this.contractId,
+      functionName:  'revoke_session',
       args: [{ type: 'u64', value: sessionId }],
-      network: this.network,
-      rpcUrl:  this.rpcUrl,
+      network:         this.network,
+      rpcUrl:          this.rpcUrl,
       sourcePublicKey: ownerPublicKey,
     })
   }
 
-  /** Submit a signed XDR and wait for ledger confirmation. */
+  /**
+   * Submit a signed XDR and wait for on-chain confirmation.
+   * Returns the confirmed SubmitResult including returnValue (session ID for createSession).
+   */
   async submit(signedXdr: string): Promise<SubmitResult> {
     const res = await submitSignedXdr(signedXdr, this.network, this.rpcUrl)
-    if (!res.ok) throw new Error(`Transaction failed: ${res.error}`)
+    if (!res.ok) throw new Error(`Transaction submission failed: ${res.error}`)
     return waitForConfirmation(res.txHash, this.network, this.rpcUrl)
   }
 
+  // ---------------------------------------------------------------------------
+  // Contract read operations
+  // ---------------------------------------------------------------------------
+
   /**
-   * Fetch current session state from on-chain ledger entries.
+   * Fetch current session state from on-chain persistent ledger entries.
    *
-   * Real impl:
-   *   const sessionKey = xdr.ScVal.scvVec([
-   *     xdr.ScVal.scvSymbol('Session'),
-   *     xdr.ScVal.scvU64(xdr.Uint64.fromString(sessionId.toString()))
-   *   ])
-   *   const entries = await server.getLedgerEntries(contractDataKey(contractId, sessionKey))
-   *   return decodeSessionXdr(entries[0].val)
+   * Constructs the contract data key for Session(session_id) and decodes
+   * the returned XDR into an AgentSession.
    */
   async getSession(sessionId: bigint): Promise<AgentSession> {
-    console.log(`[AgentWalletClient] getSession — session=${sessionId}`)
-    // WAVE CONTRIBUTION GAP — Real impl: getLedgerEntries + XDR decode
+    const server = new SorobanRpc.Server(this.rpcUrl, { allowHttp: false })
+
+    // Build the contract data ledger key:
+    //   key = ScVal::Vec([Symbol("Session"), U64(sessionId)])
+    const sessionKey = xdr.ScVal.scvVec([
+      xdr.ScVal.scvSymbol('Session'),
+      xdr.ScVal.scvU64(
+        xdr.Uint64.fromString(sessionId.toString()),
+      ),
+    ])
+
+    const contractDataKey = xdr.LedgerKey.contractData(
+      new xdr.LedgerKeyContractData({
+        contract:   new Contract(this.contractId).address().toScAddress(),
+        key:        sessionKey,
+        durability: xdr.ContractDataDurability.persistent(),
+      }),
+    )
+
+    const entries = await server.getLedgerEntries(contractDataKey)
+    if (!entries.entries.length) {
+      throw new Error(`Session ${sessionId} not found on-chain.`)
+    }
+
+    const val = entries.entries[0].val
+    // val is a LedgerEntryData — extract the contract data val field
+    const scVal = val.contractData().val()
+    const raw = scValToNative(scVal) as {
+      agent_key:            string
+      limit_per_tx:         bigint
+      limit_per_session:    bigint
+      spent_this_session:   bigint
+      expires_at_ledger:    number
+      active:               boolean
+    }
+
     return {
       sessionId,
-      agentPublicKey:     'G...',
-      limitPerTxUsdc:     100,
-      limitPerSessionUsdc: 1000,
-      spentUsdc:          0,
-      expiresAtLedger:    0,
-      active:             true,
+      agentPublicKey:      raw.agent_key,
+      limitPerTxUsdc:      Number(raw.limit_per_tx)       / STROOPS_PER_USDC,
+      limitPerSessionUsdc: Number(raw.limit_per_session)  / STROOPS_PER_USDC,
+      spentUsdc:           Number(raw.spent_this_session) / STROOPS_PER_USDC,
+      expiresAtLedger:     raw.expires_at_ledger,
+      active:              raw.active,
     }
+  }
+
+  /**
+   * Fetch the wallet's total lifetime spent amount (i128 stroops → USDC).
+   */
+  async getTotalSpent(): Promise<number> {
+    const server = new SorobanRpc.Server(this.rpcUrl, { allowHttp: false })
+
+    const totalSpentKey = xdr.ScVal.scvSymbol('TotalSpent')
+    const contractDataKey = xdr.LedgerKey.contractData(
+      new xdr.LedgerKeyContractData({
+        contract:   new Contract(this.contractId).address().toScAddress(),
+        key:        totalSpentKey,
+        durability: xdr.ContractDataDurability.persistent(),
+      }),
+    )
+
+    const entries = await server.getLedgerEntries(contractDataKey)
+    if (!entries.entries.length) return 0
+
+    const raw = scValToNative(entries.entries[0].val.contractData().val()) as bigint
+    return Number(raw) / STROOPS_PER_USDC
   }
 }
