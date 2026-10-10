@@ -20,11 +20,8 @@
  * })
  *
  * // 1. Owner creates session (signs ONCE with Freighter)
- * const { unsignedXdr } = await kit.wallet.createSession({
- *   agentKey: agentMachinePublicKey,
- *   limitPerTx: BigInt(100 * 1e7),
- *   limitPerSession: BigInt(1000 * 1e7),
- *   durationLedgers: 17280,
+ * const { unsignedXdr } = await kit.buildCreateSession({
+ *   agentPublicKey: agentMachinePublicKey,
  *   ownerPublicKey: ownerFreighterKey,
  * })
  * const signed = await freighter.signTransaction(unsignedXdr, { network: 'TESTNET' })
@@ -33,85 +30,117 @@
  *
  * // 2. Agent runs autonomously with tools
  * const tools = kit.getLangChainTools(sessionId)
- * const llm = new ChatOpenAI({ modelName: 'gpt-4o', temperature: 0 })
+ * const llm   = new ChatOpenAI({ modelName: 'gpt-4o', temperature: 0 })
  * const prompt = ChatPromptTemplate.fromMessages([
  *   ['system', 'You are a financial agent. Always check budget before paying.'],
  *   ['human', '{input}'],
  *   new MessagesPlaceholder('agent_scratchpad'),
  * ])
- * const agent = await createOpenAIFunctionsAgent({ llm, tools, prompt })
+ * const agent    = await createOpenAIFunctionsAgent({ llm, tools, prompt })
  * const executor = AgentExecutor.fromAgentAndTools({ agent, tools })
  * await executor.invoke({ input: 'Pay $50 USDC to GABC...XYZ for invoice INV-001' })
  * ```
  */
+
 import { AgentKitConfig, AgentSession } from './types'
 import { AgentWalletClient } from '../wallet/AgentWalletClient'
-import { NexusToolkit } from '../tools/NexusToolkit'
+import { NexusToolkit } from '../tools/StellarToolkit'
+import { TxHistoryService, TxRecord, TxHistorySummary } from '../history/TxHistoryService'
+import { validatePaymentParams } from '../utils'
 import { XDRResult, SubmitResult } from '../stellar'
 
-const USDC_DECIMALS  = 7
-const STROOPS_PER_USDC = 10 ** USDC_DECIMALS
-const LEDGERS_PER_DAY  = 17_280
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
 
-const toStroops = (usdc: number): bigint =>
+const USDC_DECIMALS     = 7
+const STROOPS_PER_USDC  = 10 ** USDC_DECIMALS
+const LEDGERS_PER_DAY   = 17_280
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+const toStroops  = (usdc: number): bigint =>
   BigInt(Math.round(usdc * STROOPS_PER_USDC))
 
-const fromStroops = (stroops: bigint): number =>
-  Number(stroops) / STROOPS_PER_USDC
+// ---------------------------------------------------------------------------
+// Public param/result types
+// ---------------------------------------------------------------------------
 
 export interface CreateSessionParams {
   /** Agent machine keypair public key — NEVER the owner's Freighter key */
-  agentPublicKey: string
-  /** Maximum USDC per single transaction (enforced on-chain) */
-  limitPerTxUsdc?: number
-  /** Maximum USDC across the entire session (enforced on-chain) */
+  agentPublicKey:       string
+  /** Max USDC per single transaction (enforced on-chain) */
+  limitPerTxUsdc?:      number
+  /** Max USDC across the entire session (enforced on-chain) */
   limitPerSessionUsdc?: number
-  /** Session duration in ledgers (default: 24h = 17280 ledgers) */
-  durationLedgers?: number
-  /** Owner's Stellar public key — used to build the unsigned XDR */
-  ownerPublicKey: string
+  /** Session duration in ledgers (default: 24 h = 17 280 ledgers) */
+  durationLedgers?:     number
+  /** Owner's Stellar public key — source of the unsigned XDR */
+  ownerPublicKey:       string
 }
 
 export interface PayParams {
-  sessionId:    bigint
-  recipient:    string
-  amountUsdc:   number
-  memo?:        string
-  /** Agent machine public key — signs this transaction server-side */
+  sessionId:      bigint
+  recipient:      string
+  amountUsdc:     number
+  memo?:          string
+  /** Agent machine public key — signs server-side */
   agentPublicKey: string
 }
 
+export interface PathPaymentParams {
+  sessionId:      bigint
+  agentPublicKey: string
+  recipient:      string
+  /** e.g. "XLM" or "USDC:GA5ZSEJ..." */
+  sendAsset:      string
+  receiveAsset:   string
+  /** Exact amount the recipient receives */
+  receiveAmount:  number
+  /** Maximum the agent will send (slippage guard) */
+  sendMaxAmount:  number
+  memo?:          string
+}
+
 export interface PayResult {
-  /** Transaction hash from Stellar network */
-  txHash:       string
-  /** Total USDC spent this session after this payment */
-  newSpentUsdc: number
-  /** Remaining budget in USDC */
+  txHash:        string
+  newSpentUsdc:  number
   remainingUsdc: number
 }
 
+// ---------------------------------------------------------------------------
+// AgentKit
+// ---------------------------------------------------------------------------
+
 export class AgentKit {
-  /** Direct access to the wallet contract client for advanced usage */
-  readonly wallet: AgentWalletClient
-  /** Direct access to tool definitions for custom agent frameworks */
-  readonly tools:  NexusToolkit
-  private config:  AgentKitConfig
+  /** Direct access to the wallet contract client */
+  readonly wallet:   AgentWalletClient
+  /** Direct access to tool definitions */
+  readonly tools:    NexusToolkit
+  /** Payment history for this kit instance */
+  readonly history:  TxHistoryService
+
+  private readonly config: AgentKitConfig
 
   constructor(config: AgentKitConfig) {
-    this.config = config
-    this.wallet = new AgentWalletClient(config)
-    this.tools  = new NexusToolkit(config)
+    this.config  = config
+    this.wallet  = new AgentWalletClient(config)
+    this.tools   = new NexusToolkit(config)
+    this.history = new TxHistoryService({ network: config.network, rpcUrl: config.rpcUrl })
   }
 
+  // ---------------------------------------------------------------------------
+  // Session management
+  // ---------------------------------------------------------------------------
+
   /**
-   * Build an unsigned XDR for creating an agent session.
-   * The OWNER must sign and submit this — it is NOT signed by the agent machine key.
-   *
-   * Returns { unsignedXdr } — pass to Freighter's signTransaction(), then call wallet.submit().
-   * The session ID is in the submit result's returnValue field.
+   * Build unsigned XDR for creating an agent session.
+   * Owner signs with Freighter — session ID is in submit result's returnValue.
    *
    * @example
-   * const { unsignedXdr } = await kit.buildCreateSession({ agentPublicKey, ownerPublicKey, ... })
+   * const { unsignedXdr } = await kit.buildCreateSession({ agentPublicKey, ownerPublicKey })
    * const signed = await freighter.signTransaction(unsignedXdr, { network: 'TESTNET' })
    * const { returnValue } = await kit.wallet.submit(signed)
    * const sessionId = BigInt(returnValue as string)
@@ -127,25 +156,61 @@ export class AgentKit {
   }
 
   /**
-   * Build an unsigned XDR for a payment within session limits.
-   * The AGENT MACHINE KEY signs this — NOT Freighter.
+   * Build unsigned XDR for revoking a session.
+   * Owner signs with Freighter — immediate on-chain effect.
+   */
+  async buildRevokeSession(sessionId: bigint, ownerPublicKey: string): Promise<XDRResult> {
+    return this.wallet.revokeSession(sessionId, ownerPublicKey)
+  }
+
+  /**
+   * Fetch current session state including remaining budget.
+   */
+  async getSessionStatus(sessionId: bigint): Promise<AgentSession & { remainingUsdc: number }> {
+    const session = await this.wallet.getSession(sessionId)
+    return {
+      ...session,
+      remainingUsdc: Math.max(0, session.limitPerSessionUsdc - session.spentUsdc),
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Payment operations
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Build unsigned XDR for a direct USDC payment within session limits.
+   * Agent machine key signs server-side — NEVER in the browser.
    *
-   * This is the hot path called by the AI agent for every payment.
-   * The returned unsignedXdr must be signed server-side by the agent keypair:
+   * Validates all payment constraints client-side before building the XDR
+   * so errors are caught early without spending a transaction fee.
    *
    * @example
-   * // Server-side agent process only
    * const { unsignedXdr } = await kit.buildPay({ sessionId, recipient, amountUsdc: 50, agentPublicKey })
-   * const keypair = Keypair.fromSecret(process.env.AGENT_SECRET_KEY!) // server-side only
+   * const keypair = Keypair.fromSecret(process.env.AGENT_SECRET_KEY!)
    * const tx = TransactionBuilder.fromXDR(unsignedXdr, networkPassphrase)
    * tx.sign(keypair)
    * const { txHash } = await kit.wallet.submit(tx.toXDR())
    */
   async buildPay(params: PayParams): Promise<XDRResult> {
-    console.log(
-      `[AgentKit] buildPay — session=${params.sessionId} ` +
-      `recipient=${params.recipient} amount=${params.amountUsdc} USDC`
-    )
+    const session = await this.wallet.getSession(params.sessionId)
+
+    const { valid, errors } = validatePaymentParams({
+      recipient:      params.recipient,
+      amountUsdc:     params.amountUsdc,
+      session,
+      agentPublicKey: params.agentPublicKey,
+    })
+
+    if (!valid) {
+      return {
+        unsignedXdr:  '',
+        simulatedFee: '0',
+        ok:           false,
+        error:        errors.join(' | '),
+      }
+    }
+
     return this.wallet.executePayment({
       sessionId:      params.sessionId,
       recipient:      params.recipient,
@@ -156,80 +221,97 @@ export class AgentKit {
   }
 
   /**
-   * Convenience method: buildPay() → submit via preloaded agent keypair XDR.
-   * Fetches updated session state and returns remaining budget.
+   * Full payment flow: validate → build XDR → submit (if signedXdr provided) → record history.
    *
-   * Note: in production, the signing step (keypair.sign) happens server-side
-   * in your agent service — never in the browser. This method is a convenience
-   * wrapper that returns the result after the unsigned XDR is passed back to
-   * your signing server.
-   *
-   * WAVE CONTRIBUTION GAP: complete the actual signing flow using
-   * @stellar/stellar-sdk Keypair.fromSecret(agentSecretKey).
+   * If signedXdr is omitted the call returns a pending entry — sign server-side and
+   * call wallet.submit() manually, then call history.updateStatus() with the result.
    */
   async pay(params: PayParams & { signedXdr?: string }): Promise<PayResult> {
     const xdrResult = await this.buildPay(params)
 
-    // If a pre-signed XDR is provided (from the agent signing server), submit it
-    const submitResult = params.signedXdr
-      ? await this.wallet.submit(params.signedXdr)
-      : { txHash: `pending_sign_${Date.now()}`, ledger: 0, ok: true }
+    if (!xdrResult.ok) {
+      this.history.record({
+        sessionId:  params.sessionId,
+        recipient:  params.recipient,
+        amountUsdc: params.amountUsdc,
+        memo:       params.memo ?? '',
+        txHash:     '',
+        status:     'denied',
+      })
+      throw new Error(xdrResult.error ?? 'Payment XDR build failed')
+    }
 
-    // Fetch updated session to get new spent amount
-    const session = await this.wallet.getSession(params.sessionId)
-    const newSpentUsdc   = session.spentUsdc
-    const remainingUsdc  = session.limitPerSessionUsdc - newSpentUsdc
+    let submitResult: SubmitResult | null = null
 
-    console.log(
-      `[AgentKit] payment ${submitResult.ok ? 'executed' : 'pending signing'} — ` +
-      `${params.amountUsdc} USDC → ${params.recipient} | ` +
-      `spent: $${newSpentUsdc} | remaining: $${remainingUsdc}`
-    )
+    if (params.signedXdr) {
+      submitResult = await this.wallet.submit(params.signedXdr)
+      this.history.record({
+        sessionId:  params.sessionId,
+        recipient:  params.recipient,
+        amountUsdc: params.amountUsdc,
+        memo:       params.memo ?? '',
+        txHash:     submitResult.txHash,
+        status:     submitResult.ok ? 'success' : 'failed',
+      })
+    } else {
+      this.history.record({
+        sessionId:  params.sessionId,
+        recipient:  params.recipient,
+        amountUsdc: params.amountUsdc,
+        memo:       params.memo ?? '',
+        txHash:     xdrResult.unsignedXdr.slice(0, 16),  // placeholder until signed
+        status:     'pending',
+      })
+    }
+
+    const session      = await this.wallet.getSession(params.sessionId)
+    const newSpentUsdc  = session.spentUsdc
+    const remainingUsdc = Math.max(0, session.limitPerSessionUsdc - newSpentUsdc)
 
     return {
-      txHash:       submitResult.txHash,
+      txHash:        submitResult?.txHash ?? `pending_${Date.now()}`,
       newSpentUsdc,
       remainingUsdc,
     }
   }
 
-  /**
-   * Build an unsigned XDR for revoking a session.
-   * OWNER signs this — immediate on-chain effect.
-   *
-   * @example
-   * const { unsignedXdr } = await kit.buildRevokeSession(sessionId, ownerPublicKey)
-   * const signed = await freighter.signTransaction(unsignedXdr, { network: 'TESTNET' })
-   * await kit.wallet.submit(signed)
-   */
-  async buildRevokeSession(sessionId: bigint, ownerPublicKey: string): Promise<XDRResult> {
-    console.log(`[AgentKit] buildRevokeSession — session=${sessionId}`)
-    return this.wallet.revokeSession(sessionId, ownerPublicKey)
-  }
+  // ---------------------------------------------------------------------------
+  // Path payment
+  // ---------------------------------------------------------------------------
 
   /**
-   * Get current session status including remaining budget.
+   * Build unsigned XDR for a cross-asset path payment via Stellar SDEX.
+   * Uses pathPaymentStrictReceive — recipient gets exactly receiveAmount.
+   * Agent machine key signs server-side.
    */
-  async getSessionStatus(sessionId: bigint): Promise<AgentSession & { remainingUsdc: number }> {
-    const session = await this.wallet.getSession(sessionId)
-    return {
-      ...session,
-      remainingUsdc: session.limitPerSessionUsdc - session.spentUsdc,
-    }
+  async buildPathPayment(params: PathPaymentParams): Promise<{ unsignedXdr: string; ok: boolean; error?: string }> {
+    return this.tools.buildPathPaymentXdr(params)
   }
 
-  /**
-   * LangChain-compatible tool definitions for this kit.
-   * Pass the returned array to createOpenAIFunctionsAgent() or AgentExecutor.
-   */
+  // ---------------------------------------------------------------------------
+  // History helpers
+  // ---------------------------------------------------------------------------
+
+  /** All payment records for this kit instance. */
+  getPaymentHistory(): readonly TxRecord[] {
+    return this.history.getAll()
+  }
+
+  /** Summary statistics across all or a specific session's payments. */
+  getHistorySummary(sessionId?: bigint): TxHistorySummary {
+    return this.history.getSummary(sessionId)
+  }
+
+  // ---------------------------------------------------------------------------
+  // Tool adapters
+  // ---------------------------------------------------------------------------
+
+  /** LangChain DynamicStructuredTool-compatible definitions. */
   getLangChainTools(sessionId: bigint) {
     return this.tools.getLangChainTools(sessionId, this)
   }
 
-  /**
-   * OpenAI Assistants API v2 tool definitions.
-   * Use these with the Assistants API run-polling flow.
-   */
+  /** OpenAI Assistants API v2 function definitions. */
   getOpenAIFunctions(sessionId: bigint) {
     return this.tools.getOpenAIFunctions(sessionId)
   }
